@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Benchmark Greedy vs Hungarian across scenario sizes, time-window tightness and
+seeds. Runs fully offline (imports the services' code directly; no servers needed).
+
+    python scripts/benchmark.py              # full sweep, writes docs/benchmark_results.md
+    python scripts/benchmark.py --quick      # smaller sweep
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import statistics
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "services" / "allocation-service"))
+
+
+def _load_pkg(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path / "__init__.py", submodule_search_locations=[str(path)])
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_load_pkg("fleet_app", ROOT / "services" / "fleet-service" / "app")
+from fleet_app import generator as fleet_gen  # noqa: E402
+from fleet_app.models import GenerateRequest, Tightness  # noqa: E402
+
+from app import engine  # noqa: E402
+from app.models import Algorithm, AllocationRequest, Order, Truck  # noqa: E402
+
+# (short label, algorithm, extra request fields)
+VARIANTS = [
+    ("G", Algorithm.GREEDY, {}),
+    ("H", Algorithm.HUNGARIAN, {"hungarian_wait_horizon": None}),
+    ("H60", Algorithm.HUNGARIAN, {"hungarian_wait_horizon": 60}),
+]
+LEGEND = ("G = Greedy (urgent-first, earliest-deadline, cheapest truck). "
+          "H = pure batched Hungarian. H60 = batched Hungarian with a 60-min look-ahead (the default).")
+
+
+def scenario(n_trucks, n_orders, tightness, seed, city="bengaluru"):
+    _, _, trucks, orders = fleet_gen.generate(
+        GenerateRequest(city=city, num_trucks=n_trucks, num_orders=n_orders, tightness=tightness), seed)
+    return [Truck(**t.model_dump()) for t in trucks], [Order(**o.model_dump()) for o in orders]
+
+
+def run(trucks, orders, algo, single_stop=False, **extra):
+    req = AllocationRequest(trucks=trucks, orders=orders, algorithm=algo, single_stop=single_stop, **extra)
+    return engine.run(req).metrics
+
+
+def sweep(sizes, tightnesses, seeds, single_stop, variants):
+    rows = []
+    for nt, no in sizes:
+        for tight in tightnesses:
+            per = {lbl: [] for lbl, _, _ in variants}
+            for seed in seeds:
+                trucks, orders = scenario(nt, no, tight, seed)
+                for lbl, algo, extra in variants:
+                    per[lbl].append(run(trucks, orders, algo, single_stop, **extra))
+            best_count = {lbl: 0 for lbl in per}
+            for i in range(len(seeds)):
+                best = min(per[l][i].objective_cost for l in per)
+                for l in per:
+                    best_count[l] += per[l][i].objective_cost <= best + 1e-6
+            mean = lambda l, k, per=per: statistics.mean(getattr(m, k) for m in per[l])  # noqa: E731
+            rows.append(((nt, no), tight, mean, best_count, len(seeds)))
+            print(f"  {nt:>3} trucks / {no:>4} orders  {tight.value:<7}  done", file=sys.stderr)
+    return rows
+
+
+def table(rows, title, labels):
+    j = " / ".join(labels)
+    out = [f"### {title}", "", f"Values are {j}.", "",
+           "| Trucks/Orders | Windows | Served | Priority-wtd served | Distance km | Km per order "
+           "| Idle wait min | Objective | Best objective (count) | Runtime ms |",
+           "|---|---|---|---|---|---|---|---|---|---|"]
+    for (nt, no), tight, mean, best, n in rows:
+        cell = lambda k, fmt: " / ".join(fmt.format(mean(l, k)) for l in labels)  # noqa: E731
+        out.append(
+            f"| {nt}/{no} | {tight.value} | {cell('fulfillment_rate', '{:.1%}')} | "
+            f"{cell('priority_weighted_fulfillment', '{:.1%}')} | {cell('total_distance_km', '{:.0f}')} | "
+            f"{cell('avg_distance_per_order_km', '{:.2f}')} | {cell('total_wait_minutes', '{:.0f}')} | "
+            f"{cell('objective_cost', '{:.0f}')} | {' / '.join(str(best[l]) for l in labels)} of {n} | "
+            f"{cell('runtime_ms', '{:.1f}')} |")
+    return "\n".join(out) + "\n"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--out", default=str(ROOT / "docs" / "benchmark_results.md"))
+    args = ap.parse_args()
+
+    sizes = [(5, 20), (12, 60), (25, 150)] if args.quick else [(5, 20), (12, 60), (25, 150), (50, 300)]
+    seeds = range(1, 4) if args.quick else range(1, 9)
+    tight = [Tightness.RELAXED, Tightness.NORMAL, Tightness.TIGHT]
+
+    print("multi-stop routes...", file=sys.stderr)
+    multi = sweep(sizes, tight, seeds, False, VARIANTS)
+    print("single-stop matching...", file=sys.stderr)
+    single_sizes = [(10, 10), (20, 30)] if args.quick else [(10, 10), (20, 30), (40, 60)]
+    single = sweep(single_sizes, tight, seeds, True, VARIANTS[:2])
+
+    md = ("# Benchmark results\n\n"
+          f"Generated by `python scripts/benchmark.py`. Each row is the mean over {len(seeds)} seeded "
+          "Bengaluru scenarios from the fleet-service generator. " + LEGEND + " Objective = soft cost of all "
+          "assignments + priority-scaled penalty for every unserved order (lower is better). "
+          "'Best objective (count)' = in how many seeds that variant achieved the lowest objective (ties count "
+          "for all). Runtimes use the SciPy solver.\n\n"
+          + table(multi, "A. Multi-stop routes (the real problem)", ["G", "H", "H60"]) + "\n"
+          + table(single, "B. Single-stop mode (one order per truck: pure bipartite matching, "
+                          "Hungarian is exactly optimal)", ["G", "H"]))
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out).write_text(md)
+    print(md)
+
+
+if __name__ == "__main__":
+    main()

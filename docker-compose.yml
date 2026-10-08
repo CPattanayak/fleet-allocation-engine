@@ -1,0 +1,33 @@
+name: fleet-allocation
+
+services:
+  fleet-service:
+    build: { context: ./services/fleet-service, target: runtime }
+    environment:
+      SEED_DEFAULT_SCENARIO: "false"   # set "true" to preload 2 demo scenarios
+    ports: ["8001:8001"]
+    restart: unless-stopped
+
+  allocation-service:
+    build: { context: ./services/allocation-service, target: runtime }
+    ports: ["8002:8002"]
+    restart: unless-stopped
+
+  api-gateway:
+    build: { context: ./services/api-gateway, target: runtime }
+    environment:
+      FLEET_SERVICE_URL: http://fleet-service:8001
+      ALLOCATION_SERVICE_URL: http://allocation-service:8002
+      CORS_ORIGINS: "*"
+    ports: ["8000:8000"]
+    depends_on:
+      fleet-service: { condition: service_healthy }
+      allocation-service: { condition: service_healthy }
+    restart: unless-stopped
+
+  frontend:
+    build: { context: ./frontend }
+    ports: ["3000:80"]
+    depends_on:
+      api-gateway: { condition: service_healthy }
+    restart: unless-stopped
